@@ -1,3 +1,71 @@
+# Fork differences from cirello.io/dynamolock
+
+This is a custom fork I've made to support two features that were out of the
+scope of the original project. I choose cirello-io package because I find it
+easy to modify and because I find brilliant all the code layout with the options
+and client usage.
+
+## Acquire Locks on same owner
+
+First option is for immediately acquire the lock when the lock owner is the same
+of the owner that created the lock. This allows to immediately reclaim an
+unreleased lock without having to wait for the lease time to consider it
+expired.
+
+Sample usage:
+
+```golang
+	lockedItem, err := c.AcquireLock("bones",
+		dynamolock.WithNoWaitOnSameOwner(),
+	)
+```
+
+When this code finds an unexpired lock check if the Existing lock owner is the
+same than the client owner and consider the existing lock expired.
+
+## Acquire Locks when it is expired according to the local clock
+
+Second option are for checking the expiration date against the local clock. For
+this the lock needs a field with the creation date that is retrieved as an
+additional attribute. This is a quite unsafe operation for distributing tasks
+because it relies on the local clocks and the local clocks can be skewed. Be
+advised that this method could not be suitable for coordination with small
+lease times or with tight tolerances.
+
+This requires an option for the client to add the creation time to each lock it
+creates, and an option to acquire lock to check that field against the local
+clock.
+
+```golang
+	c, err := dynamolock.New(svc,
+		"locks",
+		dynamolock.WithLeaseDuration(3*time.Minute),
+		dynamolock.WithUtcCreationDate(),
+	)
+
+	// [...]
+
+	lockedItem, err := c.AcquireLock("bones",
+		dynamolock.WithUnsafeLocalClockExpire(),
+	)
+```
+
+When this code finds an unexpired lock check if the creation date stored in the
+lock plus the lease duration **in the client** is less than the current time.
+Log times are in UTC.
+
+## Usage
+
+Unless you need some of the features described above, please, use original
+library. This is a custom fork I did quickly co cover two needs for a pet
+project And it is tested just to the extent of my needs. Also I won't update it
+or accept feature PR's as this is a derivative work.
+
+You will need also use `go mod` to allow overwriting the original library with
+mine in your project.
+
+And now the original doc:
+
 # DynamoDB Lock Client for Go
 
 [![GoDoc](https://godoc.org/cirello.io/dynamolock?status.svg)](https://godoc.org/cirello.io/dynamolock)
