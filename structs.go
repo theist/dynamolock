@@ -33,6 +33,7 @@ type acquireLockOptions struct {
 	additionalAttributes        map[string]*dynamodb.AttributeValue
 	sessionMonitor              *sessionMonitor
 	noWaitOnSameOwner           bool
+	unsafeClockExpire           bool
 }
 
 type getLockOptions struct {
@@ -49,6 +50,7 @@ type getLockOptions struct {
 	additionalAttributes              map[string]*dynamodb.AttributeValue
 	failIfLocked                      bool
 	noWaitOnSameOwner                 bool
+	unsafeClockExpire                 bool
 }
 
 type releaseLockOptions struct {
