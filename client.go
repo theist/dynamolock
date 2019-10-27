@@ -52,6 +52,7 @@ const (
 	attrLeaseDuration       = "leaseDuration"
 	attrRecordVersionNumber = "recordVersionNumber"
 	attrIsReleased          = "isReleased"
+	attrCreationTime        = "creationTime"
 
 	defaultBuffer = 1 * time.Second
 )
@@ -100,6 +101,7 @@ type Client struct {
 	ownerName                   string
 	locks                       sync.Map
 	sessionMonitorCancellations sync.Map
+	registerCreationDate        bool
 
 	logger Logger
 
@@ -119,14 +121,15 @@ const (
 // New creates a new dynamoDB based distributed lock client.
 func New(dynamoDB dynamodbiface.DynamoDBAPI, tableName string, opts ...ClientOption) (*Client, error) {
 	c := &Client{
-		dynamoDB:         dynamoDB,
-		tableName:        tableName,
-		partitionKeyName: defaultPartitionKeyName,
-		leaseDuration:    defaultLeaseDuration,
-		heartbeatPeriod:  defaultHeartbeatPeriod,
-		ownerName:        randString(32),
-		logger:           log.New(ioutil.Discard, "", 0),
-		stopHeartbeat:    func() {},
+		dynamoDB:             dynamoDB,
+		tableName:            tableName,
+		partitionKeyName:     defaultPartitionKeyName,
+		leaseDuration:        defaultLeaseDuration,
+		heartbeatPeriod:      defaultHeartbeatPeriod,
+		ownerName:            randString(32),
+		logger:               log.New(ioutil.Discard, "", 0),
+		registerCreationDate: false,
+		stopHeartbeat:        func() {},
 	}
 
 	for _, opt := range opts {
@@ -183,6 +186,12 @@ func DisableHeartbeat() ClientOption {
 // recorded.
 func WithLogger(l Logger) ClientOption {
 	return func(c *Client) { c.logger = l }
+}
+
+// WithUtcCreationDate adds the UTC creation date to the locks. This option in
+// the client is required for use it in combination with usnsafe expires.
+func WithUtcCreationDate() ClientOption {
+	return func(c *Client) { c.registerCreationDate = true }
 }
 
 // AcquireLockOption allows to change how the lock is actually held by the
@@ -290,6 +299,15 @@ func WithNoWaitOnSameOwner() AcquireLockOption {
 	}
 }
 
+// WithUnsafeLocalClockExpire will consider the lock expired if the utc creation date
+// and the duration exceeds the current utc date. This method is unsafe as it
+// relies that local clock is in sync with the clock thet created the lock
+func WithUnsafeLocalClockExpire() AcquireLockOption {
+	return func(opt *acquireLockOptions) {
+		opt.unsafeClockExpire = true
+	}
+}
+
 // AcquireLock holds the defined lock.
 func (c *Client) AcquireLock(key string, opts ...AcquireLockOption) (*Lock, error) {
 	if c.isClosed() {
@@ -331,6 +349,7 @@ func (c *Client) acquireLock(opt *acquireLockOptions) (*Lock, error) {
 		additionalAttributes: attrs,
 		failIfLocked:         opt.failIfLocked,
 		noWaitOnSameOwner:    opt.noWaitOnSameOwner,
+		unsafeClockExpire:    opt.unsafeClockExpire,
 	}
 
 	getLockOptions.millisecondsToWait = defaultBuffer
@@ -387,6 +406,9 @@ func (c *Client) storeLock(getLockOptions *getLockOptions) (bool, *Lock, error) 
 	item[c.partitionKeyName] = &dynamodb.AttributeValue{S: aws.String(getLockOptions.partitionKeyName)}
 	item[attrOwnerName] = &dynamodb.AttributeValue{S: aws.String(c.ownerName)}
 	item[attrLeaseDuration] = &dynamodb.AttributeValue{S: aws.String(c.leaseDuration.String())}
+	if c.registerCreationDate {
+		item[attrCreationTime] = &dynamodb.AttributeValue{S: aws.String(time.Now().UTC().String())}
+	}
 
 	recordVersionNumber := c.generateRecordVersionNumber()
 	item[attrRecordVersionNumber] = &dynamodb.AttributeValue{S: aws.String(recordVersionNumber)}
@@ -410,7 +432,29 @@ func (c *Client) storeLock(getLockOptions *getLockOptions) (bool, *Lock, error) 
 
 	if getLockOptions.noWaitOnSameOwner && existingLock != nil {
 		if existingLock.ownerName == c.ownerName {
-			c.logger.Println("Acquiring lock inmeditely because existing lock are also owned by", c.ownerName)
+			c.logger.Println("Acquiring lock inmediately because existing lock are also owned by", c.ownerName)
+			l, err := c.upsertAndMonitorExpiredLock(
+				getLockOptions.additionalAttributes,
+				getLockOptions.partitionKeyName,
+				getLockOptions.deleteLockOnRelease,
+				existingLock, newLockData, item,
+				recordVersionNumber,
+				getLockOptions.sessionMonitor)
+			return true, l, err
+		}
+	}
+	// TODO: check if lock was expired against local clock
+	if getLockOptions.unsafeClockExpire && existingLock != nil {
+		c.logger.Println("Checking for lock expired against local clock")
+		h := existingLock.additionalAttributes[attrCreationTime].S
+		c.logger.Println("Existing lock date: ", *h)
+		c.logger.Println("Client Lease: ", c.leaseDuration)
+		creationTime, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", *h)
+		if err != nil {
+			return true, nil, err
+		}
+		if creationTime.Add(c.leaseDuration).Before(time.Now().UTC()) {
+			c.logger.Println("Acquiring inmediately because existing is expired according local clock at ", time.Now().UTC())
 			l, err := c.upsertAndMonitorExpiredLock(
 				getLockOptions.additionalAttributes,
 				getLockOptions.partitionKeyName,
